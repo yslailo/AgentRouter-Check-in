@@ -114,19 +114,21 @@ jobs:
         env:
           USERNAME: ${{ secrets.USERNAME }}
           PASSWORD: ${{ secrets.PASSWORD }}
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
           NODE_LINK: ${{ secrets.NODE_LINK }}
           PROXY_CONFIG_URL: ${{ secrets.PROXY_CONFIG_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          if [ -z "$USERNAME" ]; then
-            echo "❌ USERNAME 未配置"
+          if [ -z "$ACCOUNTS" ] && { [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; }; then
+            echo "❌ 未配置账号（ACCOUNTS 或 USERNAME + PASSWORD）"
             exit 1
           fi
 
-          if [ -z "$PASSWORD" ]; then
-            echo "❌ PASSWORD 未配置"
-            exit 1
+          if [ -n "$ACCOUNTS" ]; then
+            echo "✅ 检测到 ACCOUNTS 多账号配置"
+          else
+            echo "✅ 使用单账号配置（USERNAME / PASSWORD）"
           fi
 
           if [ -z "$NODE_LINK" ] && [ -z "$PROXY_CONFIG_URL" ]; then
@@ -157,6 +159,7 @@ jobs:
         env:
           USERNAME: ${{ secrets.USERNAME }}
           PASSWORD: ${{ secrets.PASSWORD }}
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}

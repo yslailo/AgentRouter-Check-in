@@ -18,6 +18,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 USERNAME = os.getenv("USERNAME") or ""
 PASSWORD = os.getenv("PASSWORD") or ""
 
+# 多账号配置（可选）
+# 多行文本，每行一个账号，格式：邮箱:密码
+ACCOUNTS = os.getenv("ACCOUNTS") or ""
+
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or ""
 TG_CHAT_ID = os.getenv("TG_CHAT_ID") or ""
 
@@ -217,6 +221,65 @@ def send_telegram(message: str) -> bool:
     except Exception:
         # 故意不打印异常，避免异常中包含敏感信息
         return False
+
+
+# ============================================================
+# 账号解析
+# ============================================================
+
+def parse_accounts() -> list:
+    """
+    解析账号列表。
+
+    优先级：
+    1. ACCOUNTS（多行，每行 邮箱:密码）
+    2. USERNAME / PASSWORD（旧版单账号兼容）
+
+    密码中可以包含冒号，
+    只按第一个冒号分割邮箱与密码。
+    """
+
+    accounts = []
+
+    if ACCOUNTS:
+
+        for raw_line in ACCOUNTS.splitlines():
+
+            line = raw_line.strip()
+
+            if not line:
+                continue
+
+            if ":" not in line:
+                continue
+
+            username, _, password = line.partition(":")
+
+            username = username.strip()
+
+            password = password.strip()
+
+            if not username or not password:
+                continue
+
+            accounts.append(
+                {
+                    "username": username,
+                    "password": password,
+                }
+            )
+
+    # 兼容旧单账号配置
+    if not accounts and USERNAME and PASSWORD:
+
+        accounts.append(
+            {
+                "username": USERNAME,
+                "password": PASSWORD,
+            }
+        )
+
+    return accounts
 
 
 # ============================================================
@@ -501,6 +564,7 @@ def _probe_batch(batch: list) -> tuple:
 def find_clean_proxies(
     sample_size: int = PROXY_SAMPLE_SIZE,
     max_rounds: int = PROXY_MAX_ROUNDS,
+    needed_count: int = 0,
 ) -> list:
 
     pool = fetch_proxy_pool()
@@ -525,7 +589,7 @@ def find_clean_proxies(
 
     remaining = pool
 
-    needed = max(
+    needed = needed_count or max(
         1,
         MAX_LOGIN_ATTEMPTS,
     )
@@ -576,6 +640,59 @@ def find_clean_proxies(
     )
 
     return clean_proxies
+
+
+# ============================================================
+# 共享代理队列
+# ============================================================
+
+CLEAN_PROXIES = []
+
+POOL_BROKEN = False
+
+
+def pop_proxy(
+    total_accounts: int,
+) -> dict | None:
+
+    """
+    从共享代理队列取一个干净代理。
+
+    队列耗尽时重新探测，
+    探测失败则本次运行不再尝试代理池。
+    """
+
+    global CLEAN_PROXIES
+    global POOL_BROKEN
+
+    if POOL_BROKEN:
+        return None
+
+    if not CLEAN_PROXIES:
+
+        try:
+
+            needed = max(
+                1,
+                MAX_LOGIN_ATTEMPTS * total_accounts,
+            )
+
+            CLEAN_PROXIES = find_clean_proxies(
+                needed_count=needed,
+            )
+
+        except Exception:
+
+            # 不打印异常详情
+            CLEAN_PROXIES = []
+
+        if not CLEAN_PROXIES:
+
+            POOL_BROKEN = True
+
+            return None
+
+    return CLEAN_PROXIES.pop(0)
 
 
 # ============================================================
@@ -796,7 +913,8 @@ def click_email_login_button(
 # ============================================================
 
 def browser_login_complete(
-    proxy: dict | None = None
+    account: dict,
+    proxy: dict | None = None,
 ) -> dict | None:
 
     # --------------------------------------------------------
@@ -1002,7 +1120,7 @@ def browser_login_complete(
             )
 
             username_locator.fill(
-                USERNAME,
+                account["username"],
                 timeout=5000,
             )
 
@@ -1024,7 +1142,7 @@ def browser_login_complete(
             )
 
             password_locator.fill(
-                PASSWORD,
+                account["password"],
                 timeout=5000,
             )
 
@@ -1313,29 +1431,13 @@ def format_balance(
 
 
 # ============================================================
-# 主签到逻辑
+# 单账号签到
 # ============================================================
 
-def run_checkin():
-
-    # --------------------------------------------------------
-    # 检查账号配置
-    # --------------------------------------------------------
-
-    if not USERNAME or not PASSWORD:
-
-        # 不打印具体账号
-        log("配置错误：登录凭据未配置")
-
-        sys.exit(1)
-
-    # --------------------------------------------------------
-    # 登录
-    # --------------------------------------------------------
-
-    login_result = None
-
-    used_proxy = None
+def checkin_account(
+    account: dict,
+    total_accounts: int,
+) -> dict | None:
 
     # --------------------------------------------------------
     # 通道一：
@@ -1344,90 +1446,164 @@ def run_checkin():
 
     if PROXY_SERVER:
 
-        login_result = browser_login_complete()
+        result = browser_login_complete(
+            account
+        )
+
+        if result:
+            return result
 
     # --------------------------------------------------------
     # 通道二：
-    # 免费代理池
+    # 免费代理池（共享队列，耗尽自动重探）
     # --------------------------------------------------------
 
-    if not login_result:
+    for _ in range(
+        MAX_LOGIN_ATTEMPTS
+    ):
 
-        try:
-
-            clean_proxies = find_clean_proxies()
-
-        except Exception:
-
-            # 不打印异常详情
-            clean_proxies = []
-
-        # ----------------------------------------------------
-        # 使用干净代理逐个登录
-        # ----------------------------------------------------
-
-        for proxy in clean_proxies[
-            :MAX_LOGIN_ATTEMPTS
-        ]:
-
-            attempt = browser_login_complete(
-                proxy
-            )
-
-            if attempt:
-
-                login_result = attempt
-
-                used_proxy = proxy
-
-                break
-
-    # --------------------------------------------------------
-    # 登录失败
-    # --------------------------------------------------------
-
-    if not login_result:
-
-        log("签到失败")
-
-        send_telegram(
-            "❌ <b>AgentRouter 签到失败</b>"
+        proxy = pop_proxy(
+            total_accounts
         )
+
+        if proxy is None:
+            break
+
+        attempt = browser_login_complete(
+            account,
+            proxy,
+        )
+
+        if attempt:
+            return attempt
+
+    return None
+
+
+# ============================================================
+# 主签到逻辑
+# ============================================================
+
+def run_checkin():
+
+    # --------------------------------------------------------
+    # 解析账号
+    # --------------------------------------------------------
+
+    accounts = parse_accounts()
+
+    if not accounts:
+
+        # 不打印具体账号
+        log("配置错误：登录凭据未配置")
 
         sys.exit(1)
 
+    total = len(accounts)
+
+    log(f"账号数量: {total}")
+
     # --------------------------------------------------------
-    # 获取余额
+    # 逐账号签到
     # --------------------------------------------------------
 
-    balance = format_balance(
-        login_result.get(
-            "quota",
-            0
+    results = []
+
+    success_count = 0
+
+    for index, account in enumerate(
+        accounts,
+        start=1,
+    ):
+
+        label = f"账号 {index}/{total}"
+
+        login_result = checkin_account(
+            account,
+            total,
         )
-    )
+
+        # ----------------------------------------------------
+        # 单账号失败，不影响后续账号
+        # ----------------------------------------------------
+
+        if not login_result:
+
+            log(f"{label}: 签到失败")
+
+            results.append(
+                (label, None)
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # 获取余额
+        # ----------------------------------------------------
+
+        balance = format_balance(
+            login_result.get(
+                "quota",
+                0
+            )
+        )
+
+        # ----------------------------------------------------
+        # 只打印余额
+        # ----------------------------------------------------
+
+        log(f"{label}: 当前余额 {balance}")
+
+        results.append(
+            (label, balance)
+        )
+
+        success_count += 1
 
     # --------------------------------------------------------
-    # 只打印余额
+    # 汇总 Telegram 通知
     # --------------------------------------------------------
 
-    log(
-        f"当前余额: {balance}"
-    )
+    message_lines = [
+        "🎁 <b>AgentRouter 签到通知</b>",
+        "",
+    ]
 
-    # --------------------------------------------------------
-    # Telegram
-    # --------------------------------------------------------
+    for label, balance in results:
 
-    message = (
-        "🎁 <b>AgentRouter 签到通知</b>\n\n"
-        f"💰 当前余额: {balance}\n"
-        "📋 状态: 签到成功"
+        if balance is None:
+
+            message_lines.append(
+                f"❌ {label}: 签到失败"
+            )
+
+        else:
+
+            message_lines.append(
+                f"✅ {label}: 余额 {balance}"
+            )
+
+    message_lines.append("")
+
+    message_lines.append(
+        f"📊 成功 {success_count}/{total}"
     )
 
     send_telegram(
-        message
+        "\n".join(message_lines)
     )
+
+    # --------------------------------------------------------
+    # 任一账号失败则退出码 1
+    # --------------------------------------------------------
+
+    if success_count < total:
+
+        log("部分账号签到失败")
+
+        sys.exit(1)
+
+    log("全部账号签到成功")
 
 
 # ============================================================
