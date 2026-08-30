@@ -39,7 +39,8 @@ PROXY_PASSWORD = os.getenv("PROXY_PASSWORD") or ""
 # 基础配置
 # ============================================================
 
-SITE_URL = "https://agentrouter.org"
+# 默认站点（ACCOUNTS 行中未写站点前缀时使用）
+DEFAULT_SITE_URL = "https://agentrouter.org"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -65,8 +66,6 @@ PROXY_SAMPLE_SIZE = int(
 PROXY_MAX_ROUNDS = int(
     os.getenv("PROXY_MAX_ROUNDS") or "5"
 )
-
-PROXY_TEST_URL = f"{SITE_URL}/login"
 
 PROBE_TIMEOUT = 15
 
@@ -232,11 +231,14 @@ def parse_accounts() -> list:
     解析账号列表。
 
     优先级：
-    1. ACCOUNTS（多行，每行 邮箱:密码）
+    1. ACCOUNTS（多行，每行 [站点URL|]邮箱:密码）
     2. USERNAME / PASSWORD（旧版单账号兼容）
 
-    密码中可以包含冒号，
-    只按第一个冒号分割邮箱与密码。
+    说明：
+    - 站点前缀可省略，省略时使用默认站点
+    - 站点与账号用 | 分隔
+    - 密码中可以包含冒号，
+      只按第一个冒号分割邮箱与密码
     """
 
     accounts = []
@@ -250,10 +252,21 @@ def parse_accounts() -> list:
             if not line:
                 continue
 
-            if ":" not in line:
+            site_url = ""
+
+            body = line
+
+            # 站点前缀
+            if "|" in line:
+
+                site_url, _, body = line.partition("|")
+
+                site_url = site_url.strip()
+
+            if ":" not in body:
                 continue
 
-            username, _, password = line.partition(":")
+            username, _, password = body.partition(":")
 
             username = username.strip()
 
@@ -262,8 +275,18 @@ def parse_accounts() -> list:
             if not username or not password:
                 continue
 
+            # 站点归一化
+            if not site_url:
+                site_url = DEFAULT_SITE_URL
+
+            elif not site_url.startswith("http"):
+                site_url = f"https://{site_url}"
+
+            site_url = site_url.rstrip("/")
+
             accounts.append(
                 {
+                    "site": site_url,
                     "username": username,
                     "password": password,
                 }
@@ -274,12 +297,45 @@ def parse_accounts() -> list:
 
         accounts.append(
             {
+                "site": DEFAULT_SITE_URL,
                 "username": USERNAME,
                 "password": PASSWORD,
             }
         )
 
     return accounts
+
+
+# ============================================================
+# 站点打码
+# ============================================================
+
+def mask_site(
+    site_url: str,
+) -> str:
+
+    """
+    站点域名打码。
+
+    只保留域名前几位，其余屏蔽。
+    例：https://agentrouter.org -> agen***
+    """
+
+    domain = site_url or ""
+
+    for prefix in ("https://", "http://"):
+
+        if domain.startswith(prefix):
+
+            domain = domain[len(prefix):]
+
+            break
+
+    domain = domain.split("/", 1)[0]
+
+    visible = domain[:4]
+
+    return f"{visible}***"
 
 
 # ============================================================
@@ -428,7 +484,10 @@ def looks_like_waf(
 # 探测代理
 # ============================================================
 
-def probe_proxy(proxy_item: dict):
+def probe_proxy(
+    proxy_item: dict,
+    site_url: str,
+):
 
     ip = proxy_item.get("ip")
     port = proxy_item.get("port")
@@ -452,7 +511,7 @@ def probe_proxy(proxy_item: dict):
         try:
 
             response = requests.get(
-                PROXY_TEST_URL,
+                f"{site_url}/login",
                 headers=BROWSER_HEADERS,
                 proxies={
                     "http": server,
@@ -509,7 +568,10 @@ def probe_proxy(proxy_item: dict):
 # 批量探测
 # ============================================================
 
-def _probe_batch(batch: list) -> tuple:
+def _probe_batch(
+    batch: list,
+    site_url: str,
+) -> tuple:
 
     clean = []
 
@@ -529,6 +591,7 @@ def _probe_batch(batch: list) -> tuple:
             executor.submit(
                 probe_proxy,
                 item,
+                site_url,
             ): item
             for item in batch
         }
@@ -562,6 +625,7 @@ def _probe_batch(batch: list) -> tuple:
 # ============================================================
 
 def find_clean_proxies(
+    site_url: str,
     sample_size: int = PROXY_SAMPLE_SIZE,
     max_rounds: int = PROXY_MAX_ROUNDS,
     needed_count: int = 0,
@@ -613,7 +677,8 @@ def find_clean_proxies(
             break
 
         round_clean, round_stats = _probe_batch(
-            batch
+            batch,
+            site_url,
         )
 
         clean_proxies.extend(
@@ -643,32 +708,34 @@ def find_clean_proxies(
 
 
 # ============================================================
-# 共享代理队列
+# 共享代理队列（按站点独立）
 # ============================================================
 
-CLEAN_PROXIES = []
+CLEAN_PROXIES_BY_SITE = {}
 
-POOL_BROKEN = False
+POOL_BROKEN_SITES = set()
 
 
 def pop_proxy(
+    site_url: str,
     total_accounts: int,
 ) -> dict | None:
 
     """
-    从共享代理队列取一个干净代理。
+    从该站点的共享代理队列取一个干净代理。
 
-    队列耗尽时重新探测，
-    探测失败则本次运行不再尝试代理池。
+    队列耗尽时针对该站点重新探测，
+    探测失败则本次运行不再尝试该站点的代理池。
     """
 
-    global CLEAN_PROXIES
-    global POOL_BROKEN
-
-    if POOL_BROKEN:
+    if site_url in POOL_BROKEN_SITES:
         return None
 
-    if not CLEAN_PROXIES:
+    queue = CLEAN_PROXIES_BY_SITE.get(
+        site_url
+    ) or []
+
+    if not queue:
 
         try:
 
@@ -677,22 +744,25 @@ def pop_proxy(
                 MAX_LOGIN_ATTEMPTS * total_accounts,
             )
 
-            CLEAN_PROXIES = find_clean_proxies(
+            queue = find_clean_proxies(
+                site_url=site_url,
                 needed_count=needed,
             )
 
         except Exception:
 
             # 不打印异常详情
-            CLEAN_PROXIES = []
+            queue = []
 
-        if not CLEAN_PROXIES:
+        CLEAN_PROXIES_BY_SITE[site_url] = queue
 
-            POOL_BROKEN = True
+        if not queue:
+
+            POOL_BROKEN_SITES.add(site_url)
 
             return None
 
-    return CLEAN_PROXIES.pop(0)
+    return queue.pop(0)
 
 
 # ============================================================
@@ -987,7 +1057,7 @@ def browser_login_complete(
             # ------------------------------------------------
 
             page.goto(
-                f"{SITE_URL}/login",
+                f"{account['site']}/login",
                 wait_until="domcontentloaded",
                 timeout=45000,
             )
@@ -1455,7 +1525,7 @@ def checkin_account(
 
     # --------------------------------------------------------
     # 通道二：
-    # 免费代理池（共享队列，耗尽自动重探）
+    # 免费代理池（按站点独立队列，耗尽自动重探）
     # --------------------------------------------------------
 
     for _ in range(
@@ -1463,7 +1533,8 @@ def checkin_account(
     ):
 
         proxy = pop_proxy(
-            total_accounts
+            account["site"],
+            total_accounts,
         )
 
         if proxy is None:
@@ -1511,12 +1582,21 @@ def run_checkin():
 
     success_count = 0
 
-    for index, account in enumerate(
-        accounts,
-        start=1,
-    ):
+    # 每个站点的账号计数（用于标签序号）
+    site_counters = {}
 
-        label = f"账号 {index}/{total}"
+    for account in accounts:
+
+        site = account["site"]
+
+        site_counters[site] = (
+            site_counters.get(site, 0) + 1
+        )
+
+        label = (
+            f"{mask_site(site)} "
+            f"账号{site_counters[site]}"
+        )
 
         login_result = checkin_account(
             account,
@@ -1565,7 +1645,7 @@ def run_checkin():
     # --------------------------------------------------------
 
     message_lines = [
-        "🎁 <b>AgentRouter 签到通知</b>",
+        "🎁 <b>自动签到通知</b>",
         "",
     ]
 
@@ -1628,7 +1708,7 @@ def main():
         log("脚本执行失败")
 
         send_telegram(
-            "❌ <b>AgentRouter 脚本执行失败</b>"
+            "❌ <b>签到脚本执行失败</b>"
         )
 
         sys.exit(1)
