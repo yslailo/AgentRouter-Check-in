@@ -1,0 +1,279 @@
+name: Ayrouter Daily Check-in
+
+on:
+  # ==========================================
+  # 每天北京时间 06:45 执行
+  # GitHub Actions 使用 UTC
+  # 北京时间 06:45 = UTC 22:45（前一天）
+  # ==========================================
+  schedule:
+    - cron: '45 22 * * *'
+  # 支持手动触发
+  workflow_dispatch:
+
+# ==============================
+# GitHub Actions 权限
+# ==============================
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+      # ==============================
+      # 1. 检出代码
+      # ==============================
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # ==============================
+      # 2. 安装 Python
+      # ==============================
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ==============================
+      # 3. 安装 Python 依赖
+      # ==============================
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests playwright pynacl pysocks
+
+      # ==============================
+      # 4. 缓存 Playwright 浏览器
+      # ==============================
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-v1
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      # ==============================
+      # 5. 安装 Playwright Chromium
+      # ==============================
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: |
+          # 更换 Ubuntu 镜像源
+          sudo sed -i \
+            's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' \
+            /etc/apt/sources.list.d/*.list || true
+
+          sudo sed -i \
+            's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' \
+            /etc/apt/sources.list || true
+
+          # 非交互模式
+          export DEBIAN_FRONTEND=noninteractive
+
+          # 清理 apt 缓存
+          sudo apt-get clean
+
+          # 更新 apt
+          sudo apt-get update \
+            -o Acquire::Retries=3
+
+          # 安装 Chromium 以及依赖
+          playwright install --with-deps chromium
+
+      # ==============================
+      # 6. 检查必要的文件
+      # ==============================
+      - name: Check required files
+        run: |
+          echo "当前目录:"
+          pwd
+
+          echo "当前文件:"
+          ls -la
+
+          if [ ! -f "app.py" ]; then
+            echo "❌ app.py 不存在"
+            exit 1
+          fi
+
+          echo "✅ 必要文件检查通过"
+
+      # ==============================
+      # 7. 检查 Secrets（NODE_LINK 可选）
+      # ==============================
+      - name: Check required secrets
+        env:
+          USERNAME: ${{ secrets.USERNAME }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          PROXY_CONFIG_URL: ${{ secrets.PROXY_CONFIG_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -z "$USERNAME" ]; then
+            echo "❌ USERNAME 未配置"
+            exit 1
+          fi
+
+          if [ -z "$PASSWORD" ]; then
+            echo "❌ PASSWORD 未配置"
+            exit 1
+          fi
+
+          if [ -z "$NODE_LINK" ] && [ -z "$PROXY_CONFIG_URL" ]; then
+            echo "⚠️ NODE_LINK / PROXY_CONFIG_URL 未配置，跳过自有节点，将使用代理池探测"
+          else
+            echo "✅ 检测到自有节点配置，优先使用 sing-box 干净节点"
+          fi
+
+          echo "✅ Secrets 基本检查通过"
+
+      # ==============================
+      # 8. 设置代理（配置了 NODE_LINK / PROXY_CONFIG_URL 时启动 sing-box；
+      #    否则脚本自动跳过，后续走代理池探测）
+      # ==============================
+      - name: Setup Proxy
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          PROXY_CONFIG_URL: ${{ secrets.PROXY_CONFIG_URL }}
+        run: |
+          chmod +x setup-proxy.sh
+          bash setup-proxy.sh
+
+      # ==============================
+      # 9. 执行签到（有 PROXY_SERVER 时用自有节点，
+      #    失败或未配置时自动回退到代理池 WAF 探测）
+      # ==============================
+      - name: Run check-in script
+        env:
+          USERNAME: ${{ secrets.USERNAME }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_SERVER: ${{ env.PROXY_SERVER }}
+        run: |
+          python app.py
+
+      # ==============================
+      # 10. 清理旧 Workflow 运行记录
+      # ==============================
+      - name: Clear old run jobs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "开始清理旧的 Workflow 运行记录..."
+
+          runs=$(gh run list \
+            --workflow="${{ github.workflow }}" \
+            --limit=100 \
+            --json databaseId \
+            --jq '.[].databaseId')
+
+          count=0
+
+          for run_id in $runs; do
+            count=$((count + 1))
+
+            # 保留最新的一条运行记录
+            if [ "$count" -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete "$run_id" || true
+            fi
+          done
+
+          echo "✅ 历史运行记录清理完成"
+
+      # ==============================
+      # 11. 自动保活
+      # ==============================
+      #
+      # GitHub Actions 长期没有 commit 可能被停用。
+      #
+      # 这里每天检查最后一次 commit：
+      #
+      # < 40 天：
+      #     不做任何事情
+      #
+      # >= 40 天：
+      #     修改 keepalive.txt
+      #     创建 commit
+      #     push 到 main
+      #
+      # 不依赖第三方 Keepalive Action。
+      #
+      - name: Keep repository alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=============================="
+          echo "开始检查仓库是否需要保活"
+          echo "=============================="
+
+          # 配置 Git 用户
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 获取远程 main 最新状态
+          git fetch origin main
+
+          # 确保当前处于 main
+          git checkout main
+
+          # 同步到远程最新代码
+          git reset --hard origin/main
+
+          # 获取最后一次 commit 的时间戳
+          LAST_COMMIT=$(git log -1 --format=%ct)
+
+          # 获取当前 UTC 时间戳
+          NOW=$(date +%s)
+
+          # 计算距离最后一次 commit 的天数
+          DAYS=$(( (NOW - LAST_COMMIT) / 86400 ))
+
+          echo "最后一次 commit: $(git log -1 --format='%h %ci %s')"
+          echo "距离最后一次 commit: ${DAYS} 天"
+
+          # 超过 40 天才创建保活 commit
+          if [ "$DAYS" -ge 40 ]; then
+
+            echo "⚠️ 已超过 40 天没有 commit"
+            echo "开始创建 Keepalive commit..."
+
+            # 创建/更新保活文件
+            echo "Keepalive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
+              > .github/keepalive.txt
+
+            # 添加文件
+            git add .github/keepalive.txt
+
+            # 提交
+            git commit \
+              -m "chore: keep workflow alive [skip ci]"
+
+            # 推送
+            git push origin main
+
+            echo "✅ Keepalive commit 创建成功"
+
+          else
+
+            echo "✅ 当前不需要创建 Keepalive commit"
+            echo "距离 40 天阈值还有 $((40 - DAYS)) 天"
+
+          fi
+
+          echo "=============================="
+          echo "Keepalive 检查完成"
+          echo "=============================="
