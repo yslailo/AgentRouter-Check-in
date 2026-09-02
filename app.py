@@ -699,6 +699,8 @@ def find_clean_proxies(
 
     pool = fetch_proxy_pool()
 
+    log(f"代理池获取: {len(pool)} 个代理")
+
     # 国家过滤
     if PROXY_COUNTRY:
 
@@ -710,6 +712,10 @@ def find_clean_proxies(
             ).upper()
             == PROXY_COUNTRY
         ]
+
+        log(
+            f"国家过滤后: {len(pool)} 个代理"
+        )
 
         if not pool:
             raise Exception("代理池过滤后为空")
@@ -770,6 +776,21 @@ def find_clean_proxies(
         )
     )
 
+    # 只输出数量与阶段码，不含敏感信息
+    reason_text = ", ".join(
+        f"{key} {value}"
+        for key, value in sorted(
+            stats.items(),
+            key=lambda kv: -kv[1],
+        )[:3]
+    )
+
+    log(
+        f"代理池探测: 扫描 {scanned} 个，"
+        f"可用 {len(clean_proxies)} 个"
+        + (f"（{reason_text}）" if reason_text else "")
+    )
+
     return clean_proxies
 
 
@@ -781,6 +802,11 @@ CLEAN_PROXIES_BY_SITE = {}
 
 POOL_BROKEN_SITES = set()
 
+# 直连兜底已失败的站点
+# （ Runner IP 被 WAF 拦截时，
+#   后续账号不再重复直连，避免无效耗时 ）
+DIRECT_FAILED_SITES = set()
+
 
 def pop_proxy(
     site_url: str,
@@ -790,7 +816,9 @@ def pop_proxy(
     """
     从该站点的共享代理队列取一个干净代理。
 
-    队列耗尽时针对该站点重新探测，
+    每个代理在交给浏览器登录前都会现场复检，
+    复检失败立即丢弃并尝试下一个；
+    队列耗尽时针对该站点重新探测少量代理，
     探测失败则本次运行不再尝试该站点的代理池。
     """
 
@@ -801,43 +829,76 @@ def pop_proxy(
         site_url
     ) or []
 
+    # ------------------------------------------------
+    # 现场复检：剔除探测后已失效的代理
+    # （免费代理存活期短，预探测的代理
+    #   到真正登录时可能已经死了）
+    # ------------------------------------------------
+
+    while queue:
+
+        candidate = queue.pop(0)
+
+        fresh, _ = probe_proxy(
+            candidate,
+            site_url,
+        )
+
+        if fresh is not None:
+            CLEAN_PROXIES_BY_SITE[site_url] = queue
+            return fresh
+
+    # ------------------------------------------------
+    # 队列耗尽：重新探测少量代理
+    #
+    # 不再按账号数批量预留：
+    # 预留越多，到使用时失效越多，
+    # 且首次探测耗时随账号数爆炸
+    # ------------------------------------------------
+
+    log("代理队列耗尽，重新探测代理池")
+
+    try:
+
+        queue = find_clean_proxies(
+            site_url=site_url,
+            needed_count=MAX_LOGIN_ATTEMPTS,
+        )
+
+    except Exception:
+
+        # 不打印异常详情
+        queue = []
+
+    CLEAN_PROXIES_BY_SITE[site_url] = queue
+
     if not queue:
 
-        try:
+        POOL_BROKEN_SITES.add(site_url)
 
-            # 首次探测：按账号数预留足够代理
-            if site_url not in CLEAN_PROXIES_BY_SITE:
+        log("代理池不可用，本次运行跳过代理池通道")
 
-                needed = max(
-                    1,
-                    MAX_LOGIN_ATTEMPTS * total_accounts,
-                )
+        return None
 
-            else:
+    # ------------------------------------------------
+    # 复检刚探测到的代理，
+    # 全部当场失效则返回 None
+    # ------------------------------------------------
 
-                # 队列耗尽后的补充探测：
-                # 只补少量，避免多账号时总耗时爆炸
-                needed = MAX_LOGIN_ATTEMPTS
+    while queue:
 
-            queue = find_clean_proxies(
-                site_url=site_url,
-                needed_count=needed,
-            )
+        candidate = queue.pop(0)
 
-        except Exception:
+        fresh, _ = probe_proxy(
+            candidate,
+            site_url,
+        )
 
-            # 不打印异常详情
-            queue = []
+        if fresh is not None:
+            CLEAN_PROXIES_BY_SITE[site_url] = queue
+            return fresh
 
-        CLEAN_PROXIES_BY_SITE[site_url] = queue
-
-        if not queue:
-
-            POOL_BROKEN_SITES.add(site_url)
-
-            return None
-
-    return queue.pop(0)
+    return None
 
 
 # ============================================================
@@ -1068,6 +1129,43 @@ def click_email_login_button(
 
 
 # ============================================================
+# 自有节点 → 目标站连通性预测试
+# ============================================================
+
+def own_node_reaches_site(
+    site_url: str,
+) -> bool:
+
+    """
+    测试自有节点能否连通目标站点。
+
+    仅判断传输层连通性：
+    收到任何 HTTP 响应（含 WAF 拦截页）都算可达；
+    只有超时 / 连接失败才算不可达。
+    """
+
+    proxies = {
+        "http": PROXY_SERVER,
+        "https": PROXY_SERVER,
+    }
+
+    try:
+
+        requests.get(
+            f"{site_url}/login",
+            headers=BROWSER_HEADERS,
+            proxies=proxies,
+            timeout=PROBE_TIMEOUT,
+            allow_redirects=True,
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+# ============================================================
 # 浏览器登录
 # ============================================================
 
@@ -1194,17 +1292,34 @@ def browser_login_complete(
 
             # ------------------------------------------------
             # Step 1：访问登录页
+            #
+            # commit：收到首包即认为导航开始，
+            # 页面内容由后续 WAF 等待逻辑轮询，
+            # 避免慢代理下 domcontentloaded 直接超时。
+            # 超时后重试一次。
             # ------------------------------------------------
 
-            try:
+            goto_done = False
 
-                page.goto(
-                    f"{account['site']}/login",
-                    wait_until="domcontentloaded",
-                    timeout=45000,
-                )
+            for _ in range(2):
 
-            except PlaywrightTimeoutError:
+                try:
+
+                    page.goto(
+                        f"{account['site']}/login",
+                        wait_until="commit",
+                        timeout=45000,
+                    )
+
+                    goto_done = True
+
+                    break
+
+                except PlaywrightTimeoutError:
+
+                    continue
+
+            if not goto_done:
 
                 raise _LoginStageError(
                     "GOTO_TIMEOUT"
@@ -1217,7 +1332,7 @@ def browser_login_complete(
             if not wait_for_waf_ready(
                 page,
                 context=context,
-                timeout_ms=45000,
+                timeout_ms=60000,
             ):
 
                 raise _LoginStageError(
@@ -1691,6 +1806,7 @@ def format_balance(
 def checkin_account(
     account: dict,
     total_accounts: int,
+    label: str = "",
 ) -> tuple:
 
     last_stage = "UNKNOWN"
@@ -1702,6 +1818,8 @@ def checkin_account(
 
     if PROXY_SERVER:
 
+        log(f"{label} 尝试自有节点登录")
+
         result, last_stage = browser_login_complete(
             account
         )
@@ -1709,12 +1827,17 @@ def checkin_account(
         if result:
             return result, last_stage
 
+        log(
+            f"{label} 尝试（自有节点）: "
+            f"{last_stage}"
+        )
+
     # --------------------------------------------------------
     # 通道二：
     # 免费代理池（按站点独立队列，耗尽自动重探）
     # --------------------------------------------------------
 
-    for _ in range(
+    for attempt_no in range(
         MAX_LOGIN_ATTEMPTS
     ):
 
@@ -1729,6 +1852,13 @@ def checkin_account(
 
             break
 
+        # 代理已现场复检通过，开始登录
+        log(
+            f"{label} 使用代理池代理登录"
+            f"（尝试{attempt_no + 1}"
+            f"/{MAX_LOGIN_ATTEMPTS}）"
+        )
+
         result, last_stage = browser_login_complete(
             account,
             proxy,
@@ -1737,13 +1867,28 @@ def checkin_account(
         if result:
             return result, last_stage
 
+        log(
+            f"{label} 尝试{attempt_no + 1}"
+            f"（代理池）: {last_stage}"
+        )
+
     # --------------------------------------------------------
     # 兜底：
-    # 代理池不可用（未配置自有节点）时，
-    # 尝试一次直连登录，与单账号路径保持一致
+    # 未配置自有节点时，代理池不可用或
+    # 全部尝试失败后，再尝试一次直连登录
+    #
+    # 每个站点只直连兜底一次：
+    # 直连失败说明 Runner IP 已被拦截，
+    # 后续账号重复直连只会白耗时间
     # --------------------------------------------------------
 
-    if last_stage == "NO_PROXY" and not PROXY_SERVER:
+    if (
+        not PROXY_SERVER
+        and account["site"]
+        not in DIRECT_FAILED_SITES
+    ):
+
+        log(f"{label} 尝试直连登录（兜底）")
 
         result, last_stage = browser_login_complete(
             account
@@ -1751,6 +1896,15 @@ def checkin_account(
 
         if result:
             return result, last_stage
+
+        DIRECT_FAILED_SITES.add(
+            account["site"]
+        )
+
+        log(
+            f"{label} 尝试（直连兜底）: "
+            f"{last_stage}，本站点后续不再直连"
+        )
 
     return None, last_stage
 
@@ -1802,9 +1956,15 @@ def run_checkin():
             f"账号{site_counters[site]}"
         )
 
+        log(
+            f"{label}: 开始签到"
+            f"（{index + 1}/{total}）"
+        )
+
         login_result, stage = checkin_account(
             account,
             total,
+            label,
         )
 
         # ----------------------------------------------------
