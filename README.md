@@ -107,7 +107,13 @@ A:
 1. 查看 Actions 运行日志
 2. 检查是否配置了代理
 3. 确认账号密码是否正确
-4. 查看是否有错误截图（`page_error.png`）
+### Q: 其他平台授权登陆如何获取账号密码？
+1.授权登入后 进入[个人主页]（https://agentrouter.org/console/personal）
+2.按照图片指示绑定邮箱
+3.退出登陆，再通过邮箱登陆 第一次登陆的时候需要选择忘记密码 然后通过邮箱来重置密码 
+4.拿到重置后的密码和邮箱 按照教程填写即可
+<img width="2276" height="1415" alt="cac64968dbc60bfa3a90f288da42b6e9" src="https://github.com/user-attachments/assets/eb0d7d10-ecfa-468e-9905-b18eb34594d3" />
+
 
 ## 📜 更新日志
 
