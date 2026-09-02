@@ -111,6 +111,13 @@ PROBE_WORKERS = 50
 
 MAX_LOGIN_ATTEMPTS = 3
 
+# 每个账号代理池登录轮数上限
+# （一轮登录全部失败后，
+#   重新随机提取代理再试，最多这么多轮）
+PROXY_LOGIN_ROUNDS = int(
+    os.getenv("PROXY_LOGIN_ROUNDS") or "5"
+)
+
 
 # ============================================================
 # 浏览器请求头
@@ -402,6 +409,43 @@ def mask_site(
     visible = domain[:4]
 
     return f"{visible}***"
+
+
+def mask_proxy(
+    proxy_item: dict,
+) -> str:
+
+    """
+    代理 IP 打码。
+
+    只保留前两段，其余屏蔽。
+    例：124.248.13.5:1080 -> 124.248.***.***:1080
+    """
+
+    ip = str(proxy_item.get("ip") or "")
+
+    port = proxy_item.get("port") or ""
+
+    parts = ip.split(".")
+
+    if (
+        len(parts) == 4
+        and all(
+            part.isdigit()
+            for part in parts
+        )
+    ):
+
+        return (
+            f"{parts[0]}.{parts[1]}"
+            f".***.***:{port}"
+        )
+
+    # 非 IPv4（域名 / IPv6）：
+    # 只保留前 4 位
+    visible = ip[:4]
+
+    return f"{visible}***:{port}"
 
 
 # ============================================================
@@ -1835,42 +1879,69 @@ def checkin_account(
     # --------------------------------------------------------
     # 通道二：
     # 免费代理池（按站点独立队列，耗尽自动重探）
+    #
+    # 每轮最多尝试 MAX_LOGIN_ATTEMPTS 个代理
+    # （队列耗尽时随机提取新一批探测）；
+    # 整轮登录全部失败后重新提取代理再试，
+    # 最多 PROXY_LOGIN_ROUNDS 轮
     # --------------------------------------------------------
 
-    for attempt_no in range(
-        MAX_LOGIN_ATTEMPTS
+    pool_attempted = False
+
+    for round_no in range(
+        1,
+        PROXY_LOGIN_ROUNDS + 1,
     ):
 
-        proxy = pop_proxy(
-            account["site"],
-            total_accounts,
-        )
+        for attempt_no in range(
+            MAX_LOGIN_ATTEMPTS
+        ):
 
-        if proxy is None:
+            proxy = pop_proxy(
+                account["site"],
+                total_accounts,
+            )
 
-            last_stage = "NO_PROXY"
+            if proxy is None:
+
+                break
+
+            pool_attempted = True
+
+            # 代理已现场复检通过，开始登录
+            # （IP 打码输出，避免完整泄露）
+            log(
+                f"{label} 使用代理 "
+                f"{mask_proxy(proxy)} 登录"
+                f"（第{round_no}"
+                f"/{PROXY_LOGIN_ROUNDS}轮 "
+                f"尝试{attempt_no + 1}"
+                f"/{MAX_LOGIN_ATTEMPTS}）"
+            )
+
+            result, last_stage = browser_login_complete(
+                account,
+                proxy,
+            )
+
+            if result:
+                return result, last_stage
+
+            log(
+                f"{label} 第{round_no}轮"
+                f"尝试{attempt_no + 1}"
+                f"（代理池）: {last_stage}"
+            )
+
+        # 代理池已被标记不可用时，
+        # 后续轮次不会再拿到代理，直接结束
+        if account["site"] in POOL_BROKEN_SITES:
 
             break
 
-        # 代理已现场复检通过，开始登录
-        log(
-            f"{label} 使用代理池代理登录"
-            f"（尝试{attempt_no + 1}"
-            f"/{MAX_LOGIN_ATTEMPTS}）"
-        )
+    if not pool_attempted:
 
-        result, last_stage = browser_login_complete(
-            account,
-            proxy,
-        )
-
-        if result:
-            return result, last_stage
-
-        log(
-            f"{label} 尝试{attempt_no + 1}"
-            f"（代理池）: {last_stage}"
-        )
+        last_stage = "NO_PROXY"
 
     # --------------------------------------------------------
     # 兜底：
